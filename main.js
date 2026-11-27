@@ -18,10 +18,9 @@ const {
 const config = require('./config');
 const { messageHandler, dispatchGroupUpdate } = require('./handler');
 
-// ⏱️ Hora exacta en que se encendió el proceso: ignora TODO mensaje enviado antes de prender el bot
+// ⏱️ Hora de arranque: ignora mensajes antiguos enviados antes de encender el bot
 const BOOT_TIME_SEC = Math.floor(Date.now() / 1000);
 
-// 🧠 Caché de reintentos compatible con Baileys (evita perder mensajes en ráfagas por Bad MAC)
 function createSimpleCache(ttlMs = 10 * 60 * 1000) {
   const store = new Map();
   return {
@@ -37,8 +36,7 @@ function createSimpleCache(ttlMs = 10 * 60 * 1000) {
     set(key, val) {
       store.set(key, { val, exp: Date.now() + ttlMs });
       if (store.size > 3000) {
-        const firstKey = store.keys().next().value;
-        store.delete(firstKey);
+        store.delete(store.keys().next().value);
       }
     },
     del(key) { store.delete(key); },
@@ -48,36 +46,30 @@ function createSimpleCache(ttlMs = 10 * 60 * 1000) {
 
 const msgRetryCounterCache = createSimpleCache(10 * 60 * 1000);
 
-// 📦 Almacén en memoria de mensajes recientes (para getMessage y reintentos)
 const messageStore = new Map();
 function saveMsgToStore(msg) {
   const id = msg?.key?.id;
   if (!id || !msg?.message) return;
   messageStore.set(id, msg.message);
   if (messageStore.size > 1500) {
-    const oldest = messageStore.keys().next().value;
-    messageStore.delete(oldest);
+    messageStore.delete(messageStore.keys().next().value);
   }
 }
 
-// 👥 Caché de metadatos de grupo (evita consultar a WhatsApp en cada mensaje)
 const groupMetaCache = new Map();
 const GROUP_CACHE_TTL = 5 * 60 * 1000;
 
-// 📥 COLA SEGURA DE RECEPCIÓN (Verifica cada mensaje y evita perder mensajes en ráfagas de 20+)
 const processedIds = new Set();
 const incomingQueue = [];
 let activeWorkers = 0;
 const MAX_CONCURRENT_WORKERS = 3;
-const stats = { received: 0, processed: 0, skippedOld: 0, duplicates: 0 };
+const stats = { received: 0, processed: 0, skippedOld: 0, duplicates: 0, autoHeals: 0, reconnects: 0 };
 
 function markProcessed(id) {
-  if (!id) return false;
-  if (processedIds.has(id)) return false;
+  if (!id || processedIds.has(id)) return false;
   processedIds.add(id);
   if (processedIds.size > 5000) {
-    const first = processedIds.values().next().value;
-    processedIds.delete(first);
+    processedIds.delete(processedIds.values().next().value);
   }
   return true;
 }
@@ -94,13 +86,11 @@ function enqueueIncoming(sock, msg) {
   const id = msg?.key?.id;
   if (!id) return;
 
-  // 1. Verificar duplicados
   if (!markProcessed(id)) {
     stats.duplicates++;
     return;
   }
 
-  // 2. Ignorar mensajes viejos enviados mientras el bot estaba apagado
   const ts = getMsgTimestampSec(msg);
   if (ts < BOOT_TIME_SEC - 3) {
     stats.skippedOld++;
@@ -127,10 +117,136 @@ function drainIncomingQueue() {
   }
 }
 
+// 🧹 Limpia SOLO llaves Signal corruptas (NUNCA borra creds.json ni pre-key-*.json)
+function cleanCorruptedSignalSessions() {
+  const sessionDir = path.resolve(process.cwd(), config.sessionPath);
+  if (!fs.existsSync(sessionDir)) return 0;
+
+  let removed = 0;
+  for (const file of fs.readdirSync(sessionDir)) {
+    if (
+      file.startsWith('session-') ||
+      file.startsWith('sender-key-') ||
+      file.startsWith('sender-key-memory-')
+    ) {
+      try {
+        fs.unlinkSync(path.join(sessionDir, file));
+        removed++;
+      } catch {}
+    }
+  }
+  return removed;
+}
+
+// 🩺 Control global del socket activo, Watchdog y Auto-Reparación
+let currentSock = null;
+let watchdogTimer = null;
+let reconnectTimer = null;
 let reconnectAttempts = 0;
 let isReconnecting = false;
 
+let signalErrorTimestamps = [];
+let lastAutoHealAt = 0;
+
+function destroySocket(sock) {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+  if (!sock) return;
+  try { sock.ev.removeAllListeners(); } catch {}
+  try { sock.ws?.close(); } catch {}
+  try { sock.end?.(); } catch {}
+}
+
+function scheduleReconnect(reason = 'desconexión', customDelayMs = null) {
+  if (!config.autoReconnect || isReconnecting) return;
+  isReconnecting = true;
+  reconnectAttempts++;
+  stats.reconnects++;
+
+  const oldSock = currentSock;
+  currentSock = null;
+  destroySocket(oldSock);
+
+  const delay = customDelayMs ?? Math.min(30000, 3000 * Math.pow(1.4, Math.min(reconnectAttempts, 6)));
+  console.log(chalk.yellow(`\n⚠️ Reconexión programada (${reason}). Reintentando en ${(delay / 1000).toFixed(1)}s (intento #${reconnectAttempts})...`));
+
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    isReconnecting = false;
+    startBot({ method: 'saved' });
+  }, delay);
+}
+
+// 🩹 Auto-reparación si entra una ráfaga de MessageCounterError / Bad MAC
+global.__onSignalSessionError = () => {
+  const now = Date.now();
+  signalErrorTimestamps = signalErrorTimestamps.filter(t => now - t < 15000);
+  signalErrorTimestamps.push(now);
+
+  // Si hay 15+ errores en 15 segundos y no se reparó en los últimos 3 minutos
+  if (signalErrorTimestamps.length >= 15 && now - lastAutoHealAt > 3 * 60 * 1000) {
+    lastAutoHealAt = now;
+    signalErrorTimestamps = [];
+    stats.autoHeals++;
+
+    const removed = cleanCorruptedSignalSessions();
+    console.log(chalk.bgYellow.black('\n 🩹 AUTO-REPARACIÓN DE SESIÓN ') + chalk.yellow(` Se limpiaron ${removed} llaves corruptas (creds intacto). Reconectando...`));
+    scheduleReconnect('auto-reparación Signal', 2500);
+  }
+};
+
+// 💓 Watchdog: detecta conexiones "fantasma" (socket abierto pero congelado)
+function startWatchdog(sock) {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  let missedPings = 0;
+
+  watchdogTimer = setInterval(async () => {
+    if (sock !== currentSock) {
+      clearInterval(watchdogTimer);
+      return;
+    }
+
+    const readyState = sock.ws?.readyState;
+    if (readyState !== 1) {
+      missedPings++;
+      if (missedPings >= 2) {
+        console.log(chalk.red('\n🔌 [WATCHDOG] WebSocket cerrado silenciosamente. Forzando reconexión...'));
+        scheduleReconnect('socket cerrado', 2000);
+      }
+      return;
+    }
+
+    try {
+      // Ping XMPP oficial de WhatsApp con timeout de 15s (no envía mensajes ni dispara anti-ban)
+      await Promise.race([
+        sock.query({
+          tag: 'iq',
+          attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' },
+          content: [{ tag: 'ping', attrs: {} }]
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('PING_TIMEOUT')), 15000))
+      ]);
+      missedPings = 0;
+    } catch {
+      missedPings++;
+      console.log(chalk.yellow(`⚠️ [WATCHDOG] Latido sin respuesta (${missedPings}/2)...`));
+      if (missedPings >= 2) {
+        console.log(chalk.red('\n💀 [WATCHDOG] Conexión congelada detectada. Reiniciando socket limpiamente...'));
+        scheduleReconnect('conexión congelada', 2000);
+      }
+    }
+  }, 60000);
+}
+
 async function startBot({ method = 'saved', phone = null } = {}) {
+  // Aseguramos destruir cualquier socket previo antes de abrir uno nuevo
+  if (currentSock) {
+    destroySocket(currentSock);
+    currentSock = null;
+  }
+
   const sessionDir = path.resolve(process.cwd(), config.sessionPath);
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
@@ -151,13 +267,14 @@ async function startBot({ method = 'saved', phone = null } = {}) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
-    browser: Browsers.macOS('Safari'),
-    markOnlineOnConnect: false,         // 🛡️ Anti-ban: no quedar "En línea" 24/7
+    browser: Browsers.macOS('Safari'),  // 🍎 Aparece como Safari (Mac OS)
+    markOnlineOnConnect: false,         // 🛡️ No quedar "En línea" 24/7
     syncFullHistory: false,             // ⚡ No descargar historial viejo
     fireInitQueries: false,
     generateHighQualityLinkPreview: false,
-    defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000,         // 🔄 Mantiene viva la conexión en Termux
+    defaultQueryTimeoutMs: 45000,
+    keepAliveIntervalMs: 25000,
+    connectTimeoutMs: 45000,
     retryRequestDelayMs: 400,
     msgRetryCounterCache,
     shouldIgnoreJid: jid => !jid || jid === 'status@broadcast' || jid.endsWith('@newsletter'),
@@ -166,7 +283,8 @@ async function startBot({ method = 'saved', phone = null } = {}) {
     }
   });
 
-  // Helper de caché de grupos adjunto al socket
+  currentSock = sock;
+
   sock.getCachedGroupMetadata = async (jid, force = false) => {
     const cached = groupMetaCache.get(jid);
     if (!force && cached && Date.now() < cached.exp) return cached.data;
@@ -175,10 +293,15 @@ async function startBot({ method = 'saved', phone = null } = {}) {
     return data;
   };
   sock.botStats = stats;
+  sock.cleanSignalAndReconnect = () => {
+    const removed = cleanCorruptedSignalSessions();
+    scheduleReconnect('limpieza manual Owner', 2000);
+    return removed;
+  };
 
-  // 🔢 Emparejamiento por código de 8 dígitos si se eligió opción 2
   if (method === 'code' && phone && !sock.authState.creds.registered) {
     setTimeout(async () => {
+      if (sock !== currentSock) return;
       try {
         const code = await sock.requestPairingCode(phone);
         const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
@@ -192,8 +315,8 @@ async function startBot({ method = 'saved', phone = null } = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // 🔄 Manejo de conexión y reconexión estable con backoff progresivo
   sock.ev.on('connection.update', async (update) => {
+    if (sock !== currentSock) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr && method !== 'code') {
@@ -204,9 +327,10 @@ async function startBot({ method = 'saved', phone = null } = {}) {
     if (connection === 'open') {
       reconnectAttempts = 0;
       isReconnecting = false;
+      startWatchdog(sock);
       const myId = (sock.user?.id || '').split(':')[0];
       console.log(chalk.bgGreen.black('\n ✅ CONECTADO ') + chalk.green.bold(` ${config.botName} activo como +${myId}`));
-      console.log(chalk.gray(' 🛡️ Escudo Anti-Ban activo | ⏱️ Ignorando mensajes anteriores al arranque\n'));
+      console.log(chalk.gray(' 🛡️ Anti-Ban + Watchdog 60s + Auto-Reparación activos\n'));
     }
 
     if (connection === 'close') {
@@ -214,36 +338,38 @@ async function startBot({ method = 'saved', phone = null } = {}) {
       const reasonText = lastDisconnect?.error?.message || `código ${statusCode}`;
 
       if (statusCode === DisconnectReason.loggedOut) {
-        console.log(chalk.bgRed.white('\n 🚫 SESIÓN CERRADA ') + chalk.red(' Se desvinculó WhatsApp. Borra la carpeta "session" y vuelve a vincular.\n'));
+        destroySocket(sock);
+        currentSock = null;
+        console.log(chalk.bgRed.white('\n 🚫 SESIÓN CERRADA ') + chalk.red(' WhatsApp desvinculó el dispositivo. Borra "session" y vuelve a vincular.\n'));
         return;
       }
 
-      if (!config.autoReconnect || isReconnecting) return;
-      isReconnecting = true;
-      reconnectAttempts++;
-
-      const delay = Math.min(30000, 2500 * Math.pow(1.4, Math.min(reconnectAttempts, 6)));
-      console.log(chalk.yellow(`\n⚠️ Conexión perdida (${reasonText}). Reconectando en ${(delay / 1000).toFixed(1)}s (intento #${reconnectAttempts})...`));
-
-      setTimeout(() => {
-        isReconnecting = false;
-        startBot({ method: 'saved' });
-      }, delay);
+      // Si hubo conflicto (440) damos un respiro más largo antes de reconectar
+      const customDelay = statusCode === DisconnectReason.connectionReplaced ? 8000 : null;
+      scheduleReconnect(reasonText, customDelay);
     }
   });
 
-  // 📨 Recepción garantizada de TODOS los mensajes nuevos (ignora historial 'append')
+  // 📨 Recibe mensajes nuevos (notify) y los enviados desde tu propio WhatsApp (append)
   sock.ev.on('messages.upsert', ({ messages, type }) => {
-    if (type !== 'notify' || !Array.isArray(messages)) return;
+    if (sock !== currentSock) return;
+    if ((type !== 'notify' && type !== 'append') || !Array.isArray(messages)) return;
 
     for (const msg of messages) {
+      if (type === 'append') {
+        const ts = getMsgTimestampSec(msg);
+        if (ts < BOOT_TIME_SEC - 3) {
+          stats.skippedOld++;
+          continue;
+        }
+      }
       saveMsgToStore(msg);
       enqueueIncoming(sock, msg);
     }
   });
 
-  // 👥 Actualizaciones de participantes (Bienvenidas y Despedidas + actualización de caché)
   sock.ev.on('group-participants.update', async (update) => {
+    if (sock !== currentSock) return;
     try {
       if (!update?.id) return;
       groupMetaCache.delete(update.id);
@@ -255,7 +381,6 @@ async function startBot({ method = 'saved', phone = null } = {}) {
     }
   });
 
-  // Invalidar caché si cambian nombre/descripción del grupo
   sock.ev.on('groups.update', (updates) => {
     for (const u of updates || []) {
       if (u?.id) groupMetaCache.delete(u.id);
@@ -265,4 +390,4 @@ async function startBot({ method = 'saved', phone = null } = {}) {
   return sock;
 }
 
-module.exports = { startBot };
+module.exports = { startBot, cleanCorruptedSignalSessions };
