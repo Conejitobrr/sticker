@@ -17,9 +17,8 @@ if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const STICKER_PACK_NAME = '𝑺𝒊𝒓𝒊𝒖𝒔𝑩𝒐𝒕';
 const STICKER_AUTHOR = '';
-const DEFAULT_VIDEO_SEC = 8; // Por defecto 8s
-const MAX_VIDEO_SEC = 10;    // Tope máximo soportado por WhatsApp (10s)
-const MAX_WEBP_BYTES = 490 * 1024; // Margen seguro bajo 500 KB
+const FORCE_VIDEO_SEC = 10;         // Forzado directamente a 10 segundos
+const MAX_WEBP_BYTES = 490 * 1024;  // Margen seguro bajo el límite de 500 KB
 
 const pendingAudios = new Map();
 
@@ -138,7 +137,7 @@ async function downloadMedia(media, downloadType) {
 
 function createExif(packName = STICKER_PACK_NAME, author = STICKER_AUTHOR) {
   const json = {
-    'sticker-pack-id': 'com.siriusbot.soundsticker2',
+    'sticker-pack-id': 'com.siriusbot.soundsticker10s',
     'sticker-pack-name': packName,
     'sticker-pack-publisher': author,
     emojis: ['🔊']
@@ -167,7 +166,7 @@ async function probeMedia(filePath) {
     const duration = parseFloat(parsed.format?.duration || '0') || 0;
     return { hasAudio, duration };
   } catch {
-    return { hasAudio: true, duration: DEFAULT_VIDEO_SEC };
+    return { hasAudio: true, duration: FORCE_VIDEO_SEC };
   }
 }
 
@@ -189,28 +188,21 @@ async function inspectExistingWebp(webpPath, stickerMeta = {}) {
   }
 }
 
-// Presets progresivos con compresión WebP nivel 6 para encajar 8–10s bajo 500 KB
-async function buildAnimatedWebpSmart(inputPath, outputPath, targetSec = DEFAULT_VIDEO_SEC) {
-  const presets = targetSec >= 9
-    ? [
-        { size: 240, fps: 9, q: 46 },
-        { size: 224, fps: 8, q: 38 },
-        { size: 200, fps: 7, q: 30 },
-        { size: 176, fps: 6, q: 24 },
-        { size: 150, fps: 6, q: 18 }
-      ]
-    : [
-        { size: 280, fps: 10, q: 50 },
-        { size: 240, fps: 9, q: 42 },
-        { size: 208, fps: 8, q: 34 },
-        { size: 180, fps: 7, q: 26 },
-        { size: 150, fps: 6, q: 20 }
-      ];
+// Presets progresivos para forzar 10s completos bajo 500 KB
+async function buildAnimatedWebp10s(inputPath, outputPath) {
+  const presets = [
+    { size: 240, fps: 9, q: 46 },
+    { size: 224, fps: 8, q: 36 },
+    { size: 200, fps: 7, q: 28 },
+    { size: 176, fps: 6, q: 22 },
+    { size: 150, fps: 6, q: 16 },
+    { size: 128, fps: 5, q: 12 }
+  ];
 
   for (const p of presets) {
     await execFileAsync('ffmpeg', [
       '-y', '-i', inputPath,
-      '-t', String(targetSec),
+      '-t', String(FORCE_VIDEO_SEC),
       '-vf', `scale=${p.size}:${p.size}:force_original_aspect_ratio=decrease:flags=lanczos,fps=${p.fps},format=rgba,pad=${p.size}:${p.size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`,
       '-vcodec', 'libwebp',
       '-q:v', String(p.q),
@@ -224,7 +216,7 @@ async function buildAnimatedWebpSmart(inputPath, outputPath, targetSec = DEFAULT
       return p.size;
     }
   }
-  return 150;
+  return 128;
 }
 
 async function buildStaticWebp(inputPath, outputPath) {
@@ -258,7 +250,7 @@ module.exports = {
   name: 's2',
   aliases: ['saudio2', 'stk2'],
   category: 'convertidores',
-  desc: 'Crea stickers con sonido (8s por defecto o hasta 10s con .s2 10) + audio completo',
+  desc: 'Crea stickers con sonido forzados a 10 segundos + audio completo (o cambia el audio de un sticker)',
 
   execute: async ({ sock, msg, remoteJid, sender, args, reply }) => {
     const tempFiles = [];
@@ -270,19 +262,10 @@ module.exports = {
       const useWrapper = lowerArgs.includes('wrap') || lowerArgs.includes('v2');
       const isFijar = lowerArgs[0] === 'fijar' || lowerArgs[0] === 'audio';
 
-      // Permitir elegir duración manual: .s2 8, .s2 9, .s2 10 (tope 10s)
-      const secToken = lowerArgs.find(a => /^\d{1,2}s?$/.test(a));
-      let targetSec = DEFAULT_VIDEO_SEC;
-      if (secToken) {
-        const parsedSec = parseInt(secToken.replace('s', ''), 10);
-        if (!isNaN(parsedSec) && parsedSec >= 1) {
-          targetSec = Math.min(MAX_VIDEO_SEC, parsedSec);
-        }
-      }
-
       const targetMsg = getQuotedMessage(msg) || unwrapMessage(msg.message);
       const info = getMediaInfo(targetMsg);
 
+      // 🎙️ Fijar audio para aplicarlo a sticker, foto o video
       if (isFijar) {
         if (!info || (info.kind !== 'audio' && info.kind !== 'video' && info.kind !== 'sticker')) {
           return reply('❌ Responde a una *nota de voz*, *audio*, *video* o *sticker con sonido* usando *.s2 fijar*.');
@@ -324,10 +307,8 @@ module.exports = {
 
       if (!info || (info.kind !== 'video' && info.kind !== 'image' && info.kind !== 'sticker')) {
         return reply(
-          `🔊 *STICKER CON AUDIO LARGO (.s2)* 🔊\n\n` +
-          `📹 *Desde un video:*\n` +
-          `▪️ *.s2* _(animación 8s + audio completo)_\n` +
-          `▪️ *.s2 10* _(forzar hasta 10s máximo + audio completo)_\n\n` +
+          `🔊 *STICKER CON AUDIO 10 SEGUNDOS (.s2)* 🔊\n\n` +
+          `📹 *Desde un video:*\nEnvía o responde a un video con *.s2* (animación forzada a 10s + audio completo).\n\n` +
           `🧩 *Poner o cambiar audio a un sticker:*\n` +
           `1. Responde a un audio/video con *.s2 fijar*\n` +
           `2. Responde directo al *sticker* con *.s2*`
@@ -343,7 +324,7 @@ module.exports = {
       const id = `${Date.now()}_${Math.floor(Math.random() * 9999)}`;
       let webpBuffer = null;
       let audioBuffer = null;
-      let audioSeconds = targetSec;
+      let audioSeconds = FORCE_VIDEO_SEC;
       let isAnimated = false;
       let width = 512;
       let height = 512;
@@ -396,7 +377,7 @@ module.exports = {
           audioSeconds = Math.max(1, Math.round(audProbe.duration || 1));
         }
 
-        const dim = await buildAnimatedWebpSmart(inputPath, rawWebp, targetSec);
+        const dim = await buildAnimatedWebp10s(inputPath, rawWebp);
         width = dim;
         height = dim;
 
