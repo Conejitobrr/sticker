@@ -17,12 +17,12 @@ if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const STICKER_PACK_NAME = '𝑺𝒊𝒓𝒊𝒖𝒔𝑩𝒐𝒕';
 const STICKER_AUTHOR = '';
-const MAX_VIDEO_SEC = 8; // ⏱️ Duración de animación de 8 segundos en bucle
+const DEFAULT_VIDEO_SEC = 8; // Por defecto 8s
+const MAX_VIDEO_SEC = 10;    // Tope máximo soportado por WhatsApp (10s)
+const MAX_WEBP_BYTES = 490 * 1024; // Margen seguro bajo 500 KB
 
-// Memoria temporal para fijar un audio y pegarlo en stickers, fotos o videos
 const pendingAudios = new Map();
 
-// 🔧 Parche en memoria para Baileys v6.7.x (Campos nativos de Sound Stickers 2026)
 function patchProtoForSoundStickers() {
   const Message = proto.Message;
   const StickerMessage = proto.Message?.StickerMessage;
@@ -167,7 +167,7 @@ async function probeMedia(filePath) {
     const duration = parseFloat(parsed.format?.duration || '0') || 0;
     return { hasAudio, duration };
   } catch {
-    return { hasAudio: true, duration: 8 };
+    return { hasAudio: true, duration: DEFAULT_VIDEO_SEC };
   }
 }
 
@@ -189,30 +189,38 @@ async function inspectExistingWebp(webpPath, stickerMeta = {}) {
   }
 }
 
-// Presets optimizados para que 8 segundos quepan bajo el límite de peso de WhatsApp
-async function buildAnimatedWebp8s(inputPath, outputPath, maxSec = MAX_VIDEO_SEC) {
-  const presets = [
-    { size: 280, fps: 10, q: 48 },
-    { size: 240, fps: 9, q: 40 },
-    { size: 200, fps: 8, q: 32 },
-    { size: 176, fps: 7, q: 25 },
-    { size: 150, fps: 6, q: 20 }
-  ];
+// Presets progresivos con compresión WebP nivel 6 para encajar 8–10s bajo 500 KB
+async function buildAnimatedWebpSmart(inputPath, outputPath, targetSec = DEFAULT_VIDEO_SEC) {
+  const presets = targetSec >= 9
+    ? [
+        { size: 240, fps: 9, q: 46 },
+        { size: 224, fps: 8, q: 38 },
+        { size: 200, fps: 7, q: 30 },
+        { size: 176, fps: 6, q: 24 },
+        { size: 150, fps: 6, q: 18 }
+      ]
+    : [
+        { size: 280, fps: 10, q: 50 },
+        { size: 240, fps: 9, q: 42 },
+        { size: 208, fps: 8, q: 34 },
+        { size: 180, fps: 7, q: 26 },
+        { size: 150, fps: 6, q: 20 }
+      ];
 
   for (const p of presets) {
     await execFileAsync('ffmpeg', [
       '-y', '-i', inputPath,
-      '-t', String(maxSec),
+      '-t', String(targetSec),
       '-vf', `scale=${p.size}:${p.size}:force_original_aspect_ratio=decrease:flags=lanczos,fps=${p.fps},format=rgba,pad=${p.size}:${p.size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`,
       '-vcodec', 'libwebp',
       '-q:v', String(p.q),
-      '-compression_level', '4',
+      '-compression_level', '6',
       '-loop', '0',
       '-an',
       outputPath
     ], { timeout: 120000 });
 
-    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size <= 495 * 1024) {
+    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size <= MAX_WEBP_BYTES) {
       return p.size;
     }
   }
@@ -232,7 +240,6 @@ async function buildStaticWebp(inputPath, outputPath) {
   return 512;
 }
 
-// Extrae la pista de audio completa sin recortarla
 async function extractFullOggOpus(inputPath, outputPath) {
   await execFileAsync('ffmpeg', [
     '-y', '-i', inputPath,
@@ -251,7 +258,7 @@ module.exports = {
   name: 's2',
   aliases: ['saudio2', 'stk2'],
   category: 'convertidores',
-  desc: 'Crea stickers con sonido (animación 8s + audio completo) o cambia el audio de un sticker existente',
+  desc: 'Crea stickers con sonido (8s por defecto o hasta 10s con .s2 10) + audio completo',
 
   execute: async ({ sock, msg, remoteJid, sender, args, reply }) => {
     const tempFiles = [];
@@ -263,10 +270,19 @@ module.exports = {
       const useWrapper = lowerArgs.includes('wrap') || lowerArgs.includes('v2');
       const isFijar = lowerArgs[0] === 'fijar' || lowerArgs[0] === 'audio';
 
+      // Permitir elegir duración manual: .s2 8, .s2 9, .s2 10 (tope 10s)
+      const secToken = lowerArgs.find(a => /^\d{1,2}s?$/.test(a));
+      let targetSec = DEFAULT_VIDEO_SEC;
+      if (secToken) {
+        const parsedSec = parseInt(secToken.replace('s', ''), 10);
+        if (!isNaN(parsedSec) && parsedSec >= 1) {
+          targetSec = Math.min(MAX_VIDEO_SEC, parsedSec);
+        }
+      }
+
       const targetMsg = getQuotedMessage(msg) || unwrapMessage(msg.message);
       const info = getMediaInfo(targetMsg);
 
-      // 🎙️ 1. FIJAR UN AUDIO PARA USARLO EN UN STICKER, FOTO O VIDEO (.s2 fijar)
       if (isFijar) {
         if (!info || (info.kind !== 'audio' && info.kind !== 'video' && info.kind !== 'sticker')) {
           return reply('❌ Responde a una *nota de voz*, *audio*, *video* o *sticker con sonido* usando *.s2 fijar*.');
@@ -275,14 +291,10 @@ module.exports = {
         const id = `${Date.now()}_${Math.floor(Math.random() * 9999)}`;
         const oggOut = path.join(TEMP_DIR, `s2_fix_out_${id}.ogg`);
 
-        // Si responde a un sticker que ya tiene audio, extrae ese mismo audio
         if (info.kind === 'sticker') {
           const stkAudio = info.media?.audioMessage;
-          if (!stkAudio?.mediaKey) {
-            return reply('❌ Ese sticker no tiene audio para extraer.');
-          }
-          const audBuf = await downloadMedia(stkAudio, 'audio');
-          fs.writeFileSync(oggOut, audBuf);
+          if (!stkAudio?.mediaKey) return reply('❌ Ese sticker no tiene audio para extraer.');
+          fs.writeFileSync(oggOut, await downloadMedia(stkAudio, 'audio'));
         } else {
           const rawIn = path.join(TEMP_DIR, `s2_fix_in_${id}.${info.kind === 'video' ? 'mp4' : 'ogg'}`);
           tempFiles.push(rawIn);
@@ -312,15 +324,16 @@ module.exports = {
 
       if (!info || (info.kind !== 'video' && info.kind !== 'image' && info.kind !== 'sticker')) {
         return reply(
-          `🔊 *STICKER CON AUDIO (8 SEGUNDOS)* 🔊\n\n` +
-          `📹 *Desde un video:*\nEnvía o responde a un video con *.s2* (animación de 8s en bucle + audio completo).\n\n` +
-          `🧩 *Poner o cambiar audio a un sticker ya hecho:*\n` +
+          `🔊 *STICKER CON AUDIO LARGO (.s2)* 🔊\n\n` +
+          `📹 *Desde un video:*\n` +
+          `▪️ *.s2* _(animación 8s + audio completo)_\n` +
+          `▪️ *.s2 10* _(forzar hasta 10s máximo + audio completo)_\n\n` +
+          `🧩 *Poner o cambiar audio a un sticker:*\n` +
           `1. Responde a un audio/video con *.s2 fijar*\n` +
-          `2. Responde directo al *sticker* con *.s2* _(no pierde calidad ni movimiento)_`
+          `2. Responde directo al *sticker* con *.s2*`
         );
       }
 
-      // Verificar si hay un audio fijado vigente
       let pending = pendingAudios.get(sender);
       if (pending && (Date.now() > pending.expiresAt || !fs.existsSync(pending.path))) {
         pendingAudios.delete(sender);
@@ -330,15 +343,14 @@ module.exports = {
       const id = `${Date.now()}_${Math.floor(Math.random() * 9999)}`;
       let webpBuffer = null;
       let audioBuffer = null;
-      let audioSeconds = 8;
+      let audioSeconds = targetSec;
       let isAnimated = false;
       let width = 512;
       let height = 512;
 
-      // 🧩 CASO 1: STICKER EXISTENTE + AUDIO FIJADO (Intacto, sin pasar por video)
       if (info.kind === 'sticker') {
         if (!pending) {
-          return reply('❌ Para ponerle o cambiarle el sonido a un sticker:\n1️⃣ Responde a un audio o video con *.s2 fijar*\n2️⃣ Responde a este sticker con *.s2*');
+          return reply('❌ Primero fija un audio con *.s2 fijar* y luego responde a este sticker con *.s2*.');
         }
 
         const rawStkPath = path.join(TEMP_DIR, `s2_stk_orig_${id}.webp`);
@@ -357,7 +369,6 @@ module.exports = {
         try { fs.unlinkSync(pending.path); } catch {}
         pendingAudios.delete(sender);
 
-      // 🎥 CASO 2: VIDEO (Animación 8s + audio completo)
       } else if (info.kind === 'video') {
         isAnimated = true;
         const inputPath = path.join(TEMP_DIR, `s2_in_${id}.mp4`);
@@ -385,7 +396,7 @@ module.exports = {
           audioSeconds = Math.max(1, Math.round(audProbe.duration || 1));
         }
 
-        const dim = await buildAnimatedWebp8s(inputPath, rawWebp, MAX_VIDEO_SEC);
+        const dim = await buildAnimatedWebpSmart(inputPath, rawWebp, targetSec);
         width = dim;
         height = dim;
 
@@ -393,10 +404,9 @@ module.exports = {
         await execFileAsync('webpmux', ['-set', 'exif', exifPath, rawWebp, '-o', finalWebp]);
         webpBuffer = fs.readFileSync(finalWebp);
 
-      // 🖼️ CASO 3: IMAGEN ESTÁTICA + AUDIO FIJADO
       } else {
         if (!pending) {
-          return reply('❌ Una foto no tiene audio. Responde primero a una nota de voz con *.s2 fijar* y luego a esta foto con *.s2*.');
+          return reply('❌ Una foto no tiene audio. Responde primero a un audio con *.s2 fijar* y luego a esta foto con *.s2*.');
         }
 
         const inputPath = path.join(TEMP_DIR, `s2_in_${id}.jpg`);
@@ -421,7 +431,6 @@ module.exports = {
         webpBuffer = fs.readFileSync(finalWebp);
       }
 
-      // ☁️ Subir WebP + Audio OGG a los servidores de WhatsApp
       const [stickerUpload, audioUpload] = await Promise.all([
         prepareWAMessageMedia({ sticker: webpBuffer }, { upload: sock.waUploadToServer }),
         prepareWAMessageMedia(
