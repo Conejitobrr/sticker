@@ -18,7 +18,6 @@ const {
 const config = require('./config');
 const { messageHandler, dispatchGroupUpdate } = require('./handler');
 
-// ⏱️ Hora de arranque: ignora mensajes antiguos enviados antes de encender el bot
 const BOOT_TIME_SEC = Math.floor(Date.now() / 1000);
 
 function createSimpleCache(ttlMs = 10 * 60 * 1000) {
@@ -35,9 +34,7 @@ function createSimpleCache(ttlMs = 10 * 60 * 1000) {
     },
     set(key, val) {
       store.set(key, { val, exp: Date.now() + ttlMs });
-      if (store.size > 3000) {
-        store.delete(store.keys().next().value);
-      }
+      if (store.size > 3000) store.delete(store.keys().next().value);
     },
     del(key) { store.delete(key); },
     flushAll() { store.clear(); }
@@ -51,26 +48,24 @@ function saveMsgToStore(msg) {
   const id = msg?.key?.id;
   if (!id || !msg?.message) return;
   messageStore.set(id, msg.message);
-  if (messageStore.size > 1500) {
-    messageStore.delete(messageStore.keys().next().value);
-  }
+  if (messageStore.size > 1500) messageStore.delete(messageStore.keys().next().value);
 }
 
+// 👥 Caché de grupos con deduplicación (evita Timed Out en ráfagas)
 const groupMetaCache = new Map();
-const GROUP_CACHE_TTL = 5 * 60 * 1000;
+const inFlightGroupMeta = new Map();
+const GROUP_CACHE_TTL = 10 * 60 * 1000;
 
 const processedIds = new Set();
 const incomingQueue = [];
 let activeWorkers = 0;
 const MAX_CONCURRENT_WORKERS = 3;
-const stats = { received: 0, processed: 0, skippedOld: 0, duplicates: 0, autoHeals: 0, reconnects: 0 };
+const stats = { received: 0, processed: 0, skippedOld: 0, duplicates: 0, reconnects: 0 };
 
 function markProcessed(id) {
   if (!id || processedIds.has(id)) return false;
   processedIds.add(id);
-  if (processedIds.size > 5000) {
-    processedIds.delete(processedIds.values().next().value);
-  }
+  if (processedIds.size > 5000) processedIds.delete(processedIds.values().next().value);
   return true;
 }
 
@@ -117,18 +112,14 @@ function drainIncomingQueue() {
   }
 }
 
-// 🧹 Limpia SOLO llaves Signal corruptas (NUNCA borra creds.json ni pre-key-*.json)
+// 🧹 Limpieza MANUAL solamente (cuando el Owner ejecuta .fixsession). NO borra creds.json.
 function cleanCorruptedSignalSessions() {
   const sessionDir = path.resolve(process.cwd(), config.sessionPath);
   if (!fs.existsSync(sessionDir)) return 0;
 
   let removed = 0;
   for (const file of fs.readdirSync(sessionDir)) {
-    if (
-      file.startsWith('session-') ||
-      file.startsWith('sender-key-') ||
-      file.startsWith('sender-key-memory-')
-    ) {
+    if (file.startsWith('session-')) {
       try {
         fs.unlinkSync(path.join(sessionDir, file));
         removed++;
@@ -138,15 +129,11 @@ function cleanCorruptedSignalSessions() {
   return removed;
 }
 
-// 🩺 Control global del socket activo, Watchdog y Auto-Reparación
 let currentSock = null;
 let watchdogTimer = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
 let isReconnecting = false;
-
-let signalErrorTimestamps = [];
-let lastAutoHealAt = 0;
 
 function destroySocket(sock) {
   if (watchdogTimer) {
@@ -179,25 +166,15 @@ function scheduleReconnect(reason = 'desconexión', customDelayMs = null) {
   }, delay);
 }
 
-// 🩹 Auto-reparación si entra una ráfaga de MessageCounterError / Bad MAC
-global.__onSignalSessionError = () => {
-  const now = Date.now();
-  signalErrorTimestamps = signalErrorTimestamps.filter(t => now - t < 15000);
-  signalErrorTimestamps.push(now);
+// 💓 Watchdog corregido para Baileys v6.7.x (usa ws.isOpen y requiere 3 fallos reales)
+function isSocketOpen(sock) {
+  if (!sock?.ws) return false;
+  if (typeof sock.ws.isOpen === 'boolean') return sock.ws.isOpen;
+  if (sock.ws.socket && typeof sock.ws.socket.readyState === 'number') return sock.ws.socket.readyState === 1;
+  if (typeof sock.ws.readyState === 'number') return sock.ws.readyState === 1;
+  return true;
+}
 
-  // Si hay 15+ errores en 15 segundos y no se reparó en los últimos 3 minutos
-  if (signalErrorTimestamps.length >= 15 && now - lastAutoHealAt > 3 * 60 * 1000) {
-    lastAutoHealAt = now;
-    signalErrorTimestamps = [];
-    stats.autoHeals++;
-
-    const removed = cleanCorruptedSignalSessions();
-    console.log(chalk.bgYellow.black('\n 🩹 AUTO-REPARACIÓN DE SESIÓN ') + chalk.yellow(` Se limpiaron ${removed} llaves corruptas (creds intacto). Reconectando...`));
-    scheduleReconnect('auto-reparación Signal', 2500);
-  }
-};
-
-// 💓 Watchdog: detecta conexiones "fantasma" (socket abierto pero congelado)
 function startWatchdog(sock) {
   if (watchdogTimer) clearInterval(watchdogTimer);
   let missedPings = 0;
@@ -208,40 +185,37 @@ function startWatchdog(sock) {
       return;
     }
 
-    const readyState = sock.ws?.readyState;
-    if (readyState !== 1) {
+    if (!isSocketOpen(sock)) {
       missedPings++;
       if (missedPings >= 2) {
-        console.log(chalk.red('\n🔌 [WATCHDOG] WebSocket cerrado silenciosamente. Forzando reconexión...'));
-        scheduleReconnect('socket cerrado', 2000);
+        console.log(chalk.red('\n🔌 [WATCHDOG] WebSocket cerrado. Reconectando...'));
+        scheduleReconnect('socket cerrado', 3000);
       }
       return;
     }
 
     try {
-      // Ping XMPP oficial de WhatsApp con timeout de 15s (no envía mensajes ni dispara anti-ban)
       await Promise.race([
         sock.query({
           tag: 'iq',
           attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' },
           content: [{ tag: 'ping', attrs: {} }]
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('PING_TIMEOUT')), 15000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error('PING_TIMEOUT')), 20000))
       ]);
       missedPings = 0;
     } catch {
       missedPings++;
-      console.log(chalk.yellow(`⚠️ [WATCHDOG] Latido sin respuesta (${missedPings}/2)...`));
-      if (missedPings >= 2) {
-        console.log(chalk.red('\n💀 [WATCHDOG] Conexión congelada detectada. Reiniciando socket limpiamente...'));
-        scheduleReconnect('conexión congelada', 2000);
+      console.log(chalk.yellow(`⚠️ [WATCHDOG] Latido sin respuesta (${missedPings}/3)...`));
+      if (missedPings >= 3) {
+        console.log(chalk.red('\n💀 [WATCHDOG] Conexión congelada confirmada. Reiniciando socket...'));
+        scheduleReconnect('conexión congelada', 3000);
       }
     }
-  }, 60000);
+  }, 90000);
 }
 
 async function startBot({ method = 'saved', phone = null } = {}) {
-  // Aseguramos destruir cualquier socket previo antes de abrir uno nuevo
   if (currentSock) {
     destroySocket(currentSock);
     currentSock = null;
@@ -267,35 +241,48 @@ async function startBot({ method = 'saved', phone = null } = {}) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
-    browser: Browsers.macOS('Safari'),  // 🍎 Aparece como Safari (Mac OS)
-    markOnlineOnConnect: false,         // 🛡️ No quedar "En línea" 24/7
-    syncFullHistory: false,             // ⚡ No descargar historial viejo
+    browser: Browsers.macOS('Safari'),
+    markOnlineOnConnect: false,
+    syncFullHistory: false,
     fireInitQueries: false,
     generateHighQualityLinkPreview: false,
     defaultQueryTimeoutMs: 45000,
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 45000,
-    retryRequestDelayMs: 400,
+    retryRequestDelayMs: 500,
     msgRetryCounterCache,
     shouldIgnoreJid: jid => !jid || jid === 'status@broadcast' || jid.endsWith('@newsletter'),
-    getMessage: async (key) => {
-      return messageStore.get(key?.id) || { conversation: '' };
-    }
+    getMessage: async (key) => messageStore.get(key?.id) || { conversation: '' }
   });
 
   currentSock = sock;
 
+  // Caché segura con timeout de 6s y fallback para nunca bloquear la cola
   sock.getCachedGroupMetadata = async (jid, force = false) => {
     const cached = groupMetaCache.get(jid);
     if (!force && cached && Date.now() < cached.exp) return cached.data;
-    const data = await sock.groupMetadata(jid);
-    groupMetaCache.set(jid, { data, exp: Date.now() + GROUP_CACHE_TTL });
-    return data;
+
+    if (inFlightGroupMeta.has(jid)) return inFlightGroupMeta.get(jid);
+
+    const fetchPromise = Promise.race([
+      sock.groupMetadata(jid),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('META_TIMEOUT')), 6000))
+    ])
+      .then(data => {
+        groupMetaCache.set(jid, { data, exp: Date.now() + GROUP_CACHE_TTL });
+        return data;
+      })
+      .catch(() => cached?.data || null)
+      .finally(() => inFlightGroupMeta.delete(jid));
+
+    inFlightGroupMeta.set(jid, fetchPromise);
+    return fetchPromise;
   };
+
   sock.botStats = stats;
   sock.cleanSignalAndReconnect = () => {
     const removed = cleanCorruptedSignalSessions();
-    scheduleReconnect('limpieza manual Owner', 2000);
+    scheduleReconnect('limpieza manual Owner', 2500);
     return removed;
   };
 
@@ -330,7 +317,7 @@ async function startBot({ method = 'saved', phone = null } = {}) {
       startWatchdog(sock);
       const myId = (sock.user?.id || '').split(':')[0];
       console.log(chalk.bgGreen.black('\n ✅ CONECTADO ') + chalk.green.bold(` ${config.botName} activo como +${myId}`));
-      console.log(chalk.gray(' 🛡️ Anti-Ban + Watchdog 60s + Auto-Reparación activos\n'));
+      console.log(chalk.gray(' 🛡️ Anti-Ban + Watchdog Estable activos\n'));
     }
 
     if (connection === 'close') {
@@ -344,13 +331,11 @@ async function startBot({ method = 'saved', phone = null } = {}) {
         return;
       }
 
-      // Si hubo conflicto (440) damos un respiro más largo antes de reconectar
       const customDelay = statusCode === DisconnectReason.connectionReplaced ? 8000 : null;
       scheduleReconnect(reasonText, customDelay);
     }
   });
 
-  // 📨 Recibe mensajes nuevos (notify) y los enviados desde tu propio WhatsApp (append)
   sock.ev.on('messages.upsert', ({ messages, type }) => {
     if (sock !== currentSock) return;
     if ((type !== 'notify' && type !== 'append') || !Array.isArray(messages)) return;
