@@ -505,9 +505,6 @@ async function messageHandler(sock, msg, store = {}) {
       return;
     }
 
-    // Marcar como leído SOLO cuando se ejecuta un comando real
-    try { await sock.readMessages([msg.key]); } catch {}
-
     if (config.debug) {
       const time = getTime();
       console.log(chalk.gray(`╭─── ⚡ `) + chalk.yellow.bold(`EJECUTANDO COMANDO`) + chalk.cyan(` [${time}]`) + chalk.gray(` ────────`));
