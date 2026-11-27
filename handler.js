@@ -15,11 +15,36 @@ const {
   unwrapMessage
 } = require('./lib/utils');
 
-const BANNED_PATH = path.join(process.cwd(), 'lib', 'banned.json');
 const recentGroupEvents = new Map();
+const botSentIds = new Set();
 
-function cleanJid(jid = '') {
-  return String(jid).split(':')[0];
+let activeSock = null;
+let lastKnownUser = null;
+
+function setActiveSocket(sock) {
+  activeSock = sock;
+  if (sock?.user) lastKnownUser = sock.user;
+}
+
+function isSocketReady(sock) {
+  if (!sock?.ws) return false;
+  if (typeof sock.ws.isOpen === 'boolean') return sock.ws.isOpen;
+  if (sock.ws.socket && typeof sock.ws.socket.readyState === 'number') return sock.ws.socket.readyState === 1;
+  if (typeof sock.ws.readyState === 'number') return sock.ws.readyState === 1;
+  return true;
+}
+
+function sleep(ms) {
+  return new Promise(res => setTimeout(res, ms));
+}
+
+async function waitForActiveSocket(timeoutMs = 12000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (activeSock && isSocketReady(activeSock)) return activeSock;
+    await sleep(300);
+  }
+  return activeSock && isSocketReady(activeSock) ? activeSock : null;
 }
 
 function getTime() {
@@ -53,7 +78,7 @@ function parseCommandPrefix(text = '') {
 }
 
 // ==========================================
-// 🛡️ PROTECCIÓN ANTI-BAN & ANTI-OVERLIMIT
+// 🛡️ PROTECCIÓN ANTI-BAN Y COLA SEGURA
 // ==========================================
 const sendQueue = [];
 let isSending = false;
@@ -63,10 +88,6 @@ const groupBurstMap = new Map();
 
 function randomDelay(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function sleep(ms) {
-  return new Promise(res => setTimeout(res, ms));
 }
 
 async function waitForRateLimitSlot() {
@@ -93,42 +114,176 @@ async function processSendQueue() {
   const minDelay = config.antiBan?.minSendDelayMs || 1200;
   const maxDelay = config.antiBan?.maxSendDelayMs || 2200;
 
-  while (sendQueue.length > 0) {
-    const task = sendQueue.shift();
-    await waitForRateLimitSlot();
-    try {
-      await task();
-    } catch {}
-    if (sendQueue.length > 0) {
-      await sleep(randomDelay(minDelay, maxDelay));
+  try {
+    while (sendQueue.length > 0) {
+      const task = sendQueue.shift();
+      await waitForRateLimitSlot();
+      try {
+        await Promise.race([
+          task(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('QUEUE_HARD_TIMEOUT')), 35000))
+        ]);
+      } catch {}
+      if (sendQueue.length > 0) {
+        await sleep(randomDelay(minDelay, maxDelay));
+      }
     }
+  } finally {
+    isSending = false;
+    if (sendQueue.length > 0) processSendQueue();
   }
-  isSending = false;
+}
+
+function queuedSendMessage(jid, content = {}, options = {}) {
+  return new Promise((resolve, reject) => {
+    sendQueue.push(async () => {
+      try {
+        const sock = await waitForActiveSocket(12000);
+        if (!sock || !sock._rawSendMessage) {
+          throw new Error('Connection Closed');
+        }
+
+        // Simulación humana con timeout estricto de 2s para jamás trabar la cola
+        if (config.antiBan?.simulateTyping && !content.react && !content.delete) {
+          try {
+            const presence = content.audio ? 'recording' : 'composing';
+            await Promise.race([
+              sock.sendPresenceUpdate(presence, jid).catch(() => {}),
+              sleep(2000)
+            ]);
+            await sleep(randomDelay(350, 700));
+          } catch {}
+        }
+
+        if (config.debug && !content.react) {
+          const isGroup = String(jid).endsWith('@g.us');
+          let type = '📝 Texto';
+          let preview = content.text || '';
+
+          if (content.image) { type = '📸 Imagen'; preview = content.caption || '[Imagen]'; }
+          else if (content.video) { type = '🎥 Video'; preview = content.caption || '[Video]'; }
+          else if (content.audio) { type = '🎵 Audio'; preview = '[Audio]'; }
+          else if (content.sticker) { type = '🧩 Sticker'; preview = '[Sticker]'; }
+          else if (content.document) { type = '📄 Documento'; preview = content.fileName || '[Documento]'; }
+
+          const labelType = isGroup ? chalk.magenta('👥 GRUPO') : chalk.blue('👤 PRIVADO');
+          const time = getTime();
+
+          console.log(chalk.gray(`╭─── 📤 `) + chalk.cyan.bold(`BOT ENVÍA`) + chalk.cyan(` [${time}]`) + chalk.gray(` ───────────────`));
+          console.log(chalk.gray(`│ 🏷️  Destino : `) + labelType + chalk.yellow(` (+${cleanNumber(jid)})`));
+          console.log(chalk.gray(`│ 📦  Tipo    : `) + chalk.white(type));
+          if (preview) console.log(chalk.gray(`│ 💬  Msg     : `) + chalk.green(String(preview).slice(0, 70).replace(/\n/g, ' ')));
+          console.log(chalk.gray(`╰──────────────────────────────────────────\n`));
+        }
+
+        const rawPromise = sock._rawSendMessage(jid, content, options);
+        rawPromise.catch(() => {});
+
+        const result = await Promise.race([
+          rawPromise,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('SEND_TIMEOUT')), 25000))
+        ]);
+
+        if (result?.key?.id) {
+          botSentIds.add(result.key.id);
+          if (botSentIds.size > 500) botSentIds.delete(botSentIds.values().next().value);
+        }
+
+        if (config.antiBan?.simulateTyping && !content.react && !content.delete) {
+          sock.sendPresenceUpdate('paused', jid).catch(() => {});
+        }
+
+        resolve(result);
+      } catch (err) {
+        const msgErr = String(err?.message || err);
+        if (/overlimit|rate|429|too many/i.test(msgErr)) {
+          const pause = config.antiBan?.overlimitPauseMs || 15000;
+          console.log(chalk.bgYellow.black(' 🛡️ OVERLIMIT DETECTADO ') + chalk.yellow(` Enfriando ${pause / 1000}s y reintentando...`));
+          await sleep(pause);
+          const freshSock = await waitForActiveSocket(10000);
+          if (freshSock?._rawSendMessage) {
+            try {
+              const retryRes = await freshSock._rawSendMessage(jid, content, options);
+              if (retryRes?.key?.id) botSentIds.add(retryRes.key.id);
+              return resolve(retryRes);
+            } catch (e2) {
+              return reject(e2);
+            }
+          }
+        }
+
+        const time = getTime();
+        console.log(chalk.gray(`╭─── ❌ `) + chalk.red.bold(`ERROR ENVÍO`) + chalk.cyan(` [${time}]`) + chalk.gray(` ─────────────`));
+        console.log(chalk.gray(`│ ⚠️  Detalle : `) + chalk.red(msgErr));
+        console.log(chalk.gray(`╰──────────────────────────────────────────\n`));
+        reject(err);
+      }
+    });
+    processSendQueue();
+  });
+}
+
+// 🔌 Proxy vivo: los plugins largos (.saudio, .s2, .crop) siempre usan el socket conectado más reciente
+const liveSock = new Proxy({}, {
+  get(_, prop) {
+    if (prop === 'sendMessage') return queuedSendMessage;
+    if (prop === 'reply') {
+      return (jid, text, quoted, options = {}) => queuedSendMessage(jid, { text: String(text), ...options }, { quoted });
+    }
+    if (prop === 'relayMessage') {
+      return async (jid, message, opts = {}) => {
+        const s = await waitForActiveSocket(12000);
+        if (!s) throw new Error('Connection Closed');
+        const res = await s.relayMessage(jid, message, opts);
+        if (opts?.messageId) {
+          botSentIds.add(opts.messageId);
+          if (botSentIds.size > 500) botSentIds.delete(botSentIds.values().next().value);
+        }
+        return res;
+      };
+    }
+    if (prop === 'waUploadToServer') {
+      return async (...args) => {
+        const s = await waitForActiveSocket(12000);
+        if (!s) throw new Error('Connection Closed');
+        return s.waUploadToServer(...args);
+      };
+    }
+    if (prop === 'user') return activeSock?.user || lastKnownUser || {};
+
+    const s = activeSock;
+    if (!s) return undefined;
+    const val = s[prop];
+    return typeof val === 'function' ? val.bind(s) : val;
+  }
+});
+
+function attachSendLogger(sock) {
+  if (!sock || sock._loggerAttached) return;
+  sock._loggerAttached = true;
+  sock._rawSendMessage = sock.sendMessage.bind(sock);
+  sock.sendMessage = queuedSendMessage;
+  if (!sock.reply) {
+    sock.reply = (jid, text, quoted, options = {}) => queuedSendMessage(jid, { text: String(text), ...options }, { quoted });
+  }
 }
 
 function checkAntiSpam(remoteJid, senderNum, fromGroup, isOwner) {
   if (isOwner) return null;
   const now = Date.now();
 
-  // 1. Cooldown individual por usuario
   const userCd = config.antiBan?.userCooldownMs || 4000;
   const lastUser = userCooldowns.get(senderNum) || 0;
-  if (now - lastUser < userCd) {
-    return 'user_cooldown';
-  }
+  if (now - lastUser < userCd) return 'user_cooldown';
   userCooldowns.set(senderNum, now);
 
-  // 2. Protección anti-ráfaga en grupo (máx X comandos cada 20s)
   if (fromGroup) {
     const maxGroup = config.antiBan?.groupMaxCmdsPer20s || 6;
     const list = (groupBurstMap.get(remoteJid) || []).filter(t => now - t < 20000);
-    if (list.length >= maxGroup) {
-      return 'group_burst';
-    }
+    if (list.length >= maxGroup) return 'group_burst';
     list.push(now);
     groupBurstMap.set(remoteJid, list);
   }
-
   return null;
 }
 
@@ -158,8 +313,6 @@ function getAllPluginFiles(dirPath, arrayOfFiles = []) {
 
 async function dispatchGroupUpdate(sock, id, participants, action) {
   if (!id || !Array.isArray(participants) || !participants.length) return;
-  attachSendLogger(sock);
-
   const validParticipants = participants.filter(p => {
     const jid = typeof p === 'string' ? p : (p?.id || p?.jid || '');
     return jid && !isDuplicateGroupEvent(id, jid, action);
@@ -168,91 +321,10 @@ async function dispatchGroupUpdate(sock, id, participants, action) {
 
   for (const listener of groupListeners) {
     try {
-      await listener.onGroupUpdate({ sock, conn: sock, id, participants: validParticipants, action, db, config });
+      await listener.onGroupUpdate({ sock: liveSock, conn: liveSock, id, participants: validParticipants, action, db, config });
     } catch (e) {
       console.log(chalk.red(`❌ Error en onGroupUpdate: ${e?.message || e}`));
     }
-  }
-}
-
-function attachSendLogger(sock) {
-  if (sock._loggerAttached) return;
-  sock._loggerAttached = true;
-
-  const originalSend = sock.sendMessage.bind(sock);
-
-  sock.sendMessage = async (jid, content = {}, options = {}) => {
-    return new Promise((resolve, reject) => {
-      sendQueue.push(async () => {
-        try {
-          // Simulación humana breve (solo en respuestas de texto/media, no en reacciones/borrados)
-          if (config.antiBan?.simulateTyping && !content.react && !content.delete) {
-            try {
-              const presence = content.audio ? 'recording' : 'composing';
-              await sock.sendPresenceUpdate(presence, jid);
-              await sleep(randomDelay(350, 750));
-            } catch {}
-          }
-
-          if (config.debug && !content.react) {
-            const isGroup = String(jid).endsWith('@g.us');
-            let type = '📝 Texto';
-            let preview = content.text || '';
-
-            if (content.image) { type = '📸 Imagen'; preview = content.caption || '[Imagen]'; }
-            else if (content.video) { type = '🎥 Video'; preview = content.caption || '[Video]'; }
-            else if (content.audio) { type = '🎵 Audio'; preview = '[Audio]'; }
-            else if (content.sticker) { type = '🧩 Sticker'; preview = '[Sticker]'; }
-            else if (content.document) { type = '📄 Documento'; preview = content.fileName || '[Documento]'; }
-
-            const labelType = isGroup ? chalk.magenta('👥 GRUPO') : chalk.blue('👤 PRIVADO');
-            const time = getTime();
-
-            console.log(chalk.gray(`╭─── 📤 `) + chalk.cyan.bold(`BOT ENVÍA`) + chalk.cyan(` [${time}]`) + chalk.gray(` ───────────────`));
-            console.log(chalk.gray(`│ 🏷️  Destino : `) + labelType + chalk.yellow(` (+${cleanNumber(jid)})`));
-            console.log(chalk.gray(`│ 📦  Tipo    : `) + chalk.white(type));
-            if (preview) console.log(chalk.gray(`│ 💬  Msg     : `) + chalk.green(String(preview).slice(0, 70).replace(/\n/g, ' ')));
-            console.log(chalk.gray(`╰──────────────────────────────────────────\n`));
-          }
-          
-          const result = await Promise.race([
-            originalSend(jid, content, options),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('SEND_TIMEOUT')), 25000))
-          ]);
-          
-          if (config.antiBan?.simulateTyping && !content.react && !content.delete) {
-            try { await sock.sendPresenceUpdate('paused', jid); } catch {}
-          }
-
-          resolve(result);
-        } catch (err) {
-          const msgErr = String(err?.message || err);
-          // 🛡️ Detección automática de rate-overlimit / 429
-          if (/overlimit|rate|429|too many/i.test(msgErr)) {
-            const pause = config.antiBan?.overlimitPauseMs || 15000;
-            console.log(chalk.bgYellow.black(' 🛡️ OVERLIMIT DETECTADO ') + chalk.yellow(` Enfriando envíos ${pause / 1000}s y reintentando...`));
-            await sleep(pause);
-            try {
-              const retryRes = await originalSend(jid, content, options);
-              return resolve(retryRes);
-            } catch (e2) {
-              return reject(e2);
-            }
-          }
-
-          const time = getTime();
-          console.log(chalk.gray(`╭─── ❌ `) + chalk.red.bold(`ERROR ENVÍO`) + chalk.cyan(` [${time}]`) + chalk.gray(` ─────────────`));
-          console.log(chalk.gray(`│ ⚠️  Detalle : `) + chalk.red(msgErr));
-          console.log(chalk.gray(`╰──────────────────────────────────────────\n`));
-          reject(err);
-        }
-      });
-      processSendQueue();
-    });
-  };
-
-  if (!sock.reply) {
-    sock.reply = (jid, text, quoted, options = {}) => sock.sendMessage(jid, { text: String(text), ...options }, { quoted });
   }
 }
 
@@ -262,7 +334,6 @@ function loadPlugins() {
   messageListeners.length = 0;
   groupListeners.length = 0;
 
-  // Comando integrado .ping / .estado (incluye verificador de mensajes leídos)
   const builtinPing = {
     name: 'ping',
     aliases: ['p', 'estado', 'status'],
@@ -349,9 +420,6 @@ loadPlugins();
 
 async function messageHandler(sock, msg, store = {}) {
   try {
-    attachSendLogger(sock);
-
-    // Respaldo para entradas/salidas vía messageStubType
     if (msg?.messageStubType && msg?.key?.remoteJid?.endsWith('@g.us')) {
       const stub = msg.messageStubType;
       const params = Array.isArray(msg.messageStubParameters) ? msg.messageStubParameters : [];
@@ -363,16 +431,17 @@ async function messageHandler(sock, msg, store = {}) {
     }
 
     if (!msg?.message) return;
+    if (msg.key?.id && botSentIds.has(msg.key.id)) return;
 
     const key = msg.key || {};
     const remoteJid = key.remoteJid;
-    if (!remoteJid || remoteJid === 'status@broadcast') return;
+    if (!remoteJid || remoteJid === 'status@broadcast' || remoteJid.endsWith('@newsletter')) return;
 
     const fromGroup = remoteJid.endsWith('@g.us');
     let sender = fromGroup ? (key.participant || msg.participant) : remoteJid;
     sender = normalizeJid(sender || remoteJid);
 
-    const botJid = normalizeJid(sock.user?.id || '');
+    const botJid = normalizeJid((activeSock?.user || sock?.user)?.id || '');
     const body = getBody(msg);
     const pushName = msg.pushName || 'Usuario';
     const senderNumber = cleanNumber(sender);
@@ -400,7 +469,6 @@ async function messageHandler(sock, msg, store = {}) {
           isAdmin = admins.includes(senderNumber);
           isBotAdmin = admins.includes(cleanNumber(botJid));
 
-          // Resolver número real si el grupo usa @lid
           const meInGroup = participants.find(p => cleanNumber(p.id) === senderNumber || cleanNumber(p.lid) === senderNumber);
           if (meInGroup?.phoneNumber) resolvedPhoneNum = cleanNumber(meInGroup.phoneNumber);
         }
@@ -409,7 +477,6 @@ async function messageHandler(sock, msg, store = {}) {
       }
     }
 
-    // 👑 Verificación dinámica de Owner (Bot + defaultOwners + lib/owners.json, compatible con @lid)
     const ownerNumbers = config.owner;
     const isOwner = !!key.fromMe || ownerNumbers.includes(senderNumber) || ownerNumbers.includes(resolvedPhoneNum);
 
@@ -458,14 +525,14 @@ async function messageHandler(sock, msg, store = {}) {
       text: getBody({ message: contextInfo.quotedMessage })
     } : null;
 
-    const replyFn = (text, options = {}) => sock.sendMessage(remoteJid, { text: String(text), ...options }, { quoted: msg });
+    const replyFn = (text, options = {}) => queuedSendMessage(remoteJid, { text: String(text), ...options }, { quoted: msg });
     msg.reply = replyFn;
 
     const groupData = fromGroup ? await db.getGroup(remoteJid) : null;
     const userData = await db.getUser(sender);
 
     const baseCtx = {
-      sock, conn: sock,
+      sock: liveSock, conn: liveSock,
       msg, m: msg,
       remoteJid, chat: remoteJid,
       sender, botJid, pushName, body, text: body,
@@ -499,7 +566,6 @@ async function messageHandler(sock, msg, store = {}) {
 
     if (fromGroup && groupData && groupData.bot === false && !isOwner && cmdKey !== 'config') return;
 
-    // 🛡️ Verificación Anti-Spam / Cooldown (evita saturar WhatsApp)
     const spamReason = checkAntiSpam(remoteJid, senderNumber, fromGroup, isOwner);
     if (spamReason) {
       if (config.debug) {
@@ -533,12 +599,27 @@ async function messageHandler(sock, msg, store = {}) {
         console.log(chalk.gray(`╰──────────────────────────────────────────\n`));
       }
     } catch (e) {
-      console.log(chalk.red(`❌ Error en comando ${rawCommand}: ${e?.message || e}`));
-      await replyFn('❌ Ocurrió un error interno al ejecutar este comando.');
+      const errMsg = String(e?.message || e);
+      console.log(chalk.red(`❌ Error en comando ${rawCommand}: ${errMsg}`));
+      // Si el error fue por caída de red momentánea, no encadena otro envío fallido
+      if (!/Connection Closed|SEND_TIMEOUT|QUEUE_HARD_TIMEOUT/i.test(errMsg)) {
+        await replyFn('❌ Ocurrió un error interno al ejecutar este comando.').catch(() => {});
+      }
     }
   } catch (err) {
-    console.log(chalk.red(`❌ Error crítico en handler: ${err?.message || err}`));
+    const errMsg = String(err?.message || err);
+    if (!/Connection Closed/i.test(errMsg)) {
+      console.log(chalk.red(`❌ Error crítico en handler: ${errMsg}`));
+    }
   }
 }
 
-module.exports = { messageHandler, dispatchGroupUpdate, loadPlugins, commands, aliases };
+module.exports = {
+  messageHandler,
+  dispatchGroupUpdate,
+  setActiveSocket,
+  attachSendLogger,
+  loadPlugins,
+  commands,
+  aliases
+};
