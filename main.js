@@ -151,7 +151,7 @@ async function startBot({ method = 'saved', phone = null } = {}) {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
-    browser: Browsers.ubuntu('Chrome'),
+    browser: Browsers.macOS('Safari'),
     markOnlineOnConnect: false,         // 🛡️ Anti-ban: no quedar "En línea" 24/7
     syncFullHistory: false,             // ⚡ No descargar historial viejo
     fireInitQueries: false,
