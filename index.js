@@ -2,34 +2,52 @@
 
 require('dotenv').config();
 
-// 🔇 Filtro de logs basura internos de Signal/Baileys
+const fs = require('fs');
+const path = require('path');
+
+// 🔇 Filtro de logs basura + detector automático de ráfagas de llaves corruptas
 const origLog = console.log;
 const origErr = console.error;
 const origWarn = console.warn;
+const origInfo = console.info;
 
-const BLOCKED_REGEX = /Closing session|SessionEntry|_chains|chainKey|ephemeralKeyPair|registrationId|currentRatchet|pendingPreKey|messageKeys|remoteIdentityKey|Bad MAC|Failed to decrypt/i;
+const BLOCKED_REGEX = /Closing session|Closing open session|SessionEntry|_chains|chainKey|ephemeralKeyPair|registrationId|currentRatchet|pendingPreKey|messageKeys|remoteIdentityKey|Bad MAC|Failed to decrypt|MessageCounterError|Key used already or never filled|Session error:/i;
+const SIGNAL_CORRUPT_REGEX = /MessageCounterError|Key used already or never filled|Bad MAC/i;
 
-function shouldHide(args) {
+function inspectConsoleArgs(args) {
+  let hide = false;
+  let signalError = false;
+
   for (const arg of args) {
-    if (typeof arg === 'string' && BLOCKED_REGEX.test(arg)) return true;
-    if (arg && typeof arg === 'object') {
-      if (arg._chains || arg.currentRatchet || arg.pendingPreKey || arg.remoteIdentityKey) return true;
-      if (arg.message && BLOCKED_REGEX.test(arg.message)) return true;
+    if (typeof arg === 'string') {
+      if (SIGNAL_CORRUPT_REGEX.test(arg)) signalError = true;
+      if (BLOCKED_REGEX.test(arg)) hide = true;
+    } else if (arg && typeof arg === 'object') {
+      const msg = String(arg.message || '');
+      if (SIGNAL_CORRUPT_REGEX.test(msg)) signalError = true;
+      if (arg._chains || arg.currentRatchet || arg.pendingPreKey || arg.remoteIdentityKey || BLOCKED_REGEX.test(msg)) {
+        hide = true;
+      }
     }
   }
-  return false;
+
+  if (signalError && typeof global.__onSignalSessionError === 'function') {
+    try { global.__onSignalSessionError(); } catch {}
+  }
+  return hide;
 }
 
-console.log = (...a) => { if (!shouldHide(a)) origLog(...a); };
-console.error = (...a) => { if (!shouldHide(a)) origErr(...a); };
-console.warn = (...a) => { if (!shouldHide(a)) origWarn(...a); };
+console.log = (...a) => { if (!inspectConsoleArgs(a)) origLog(...a); };
+console.error = (...a) => { if (!inspectConsoleArgs(a)) origErr(...a); };
+console.warn = (...a) => { if (!inspectConsoleArgs(a)) origWarn(...a); };
+console.info = (...a) => { if (!inspectConsoleArgs(a)) origInfo(...a); };
 
-const fs = require('fs');
-const path = require('path');
 const readline = require('readline');
 const chalk = require('chalk');
 const figlet = require('figlet');
 const config = require('./config');
+
+const PID_FILE = path.resolve(process.cwd(), config.sessionPath, '.bot.pid');
 
 function ensureDirs() {
   const dirs = ['lib', 'plugins', 'session', 'temp', 'assets'];
@@ -50,6 +68,38 @@ function ensureDirs() {
   }
 }
 
+// 🔒 Evita 2 instancias simultáneas corrompiendo la carpeta session/
+async function enforceSingleInstance() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+      if (oldPid && oldPid !== process.pid) {
+        try {
+          process.kill(oldPid, 0); // Verifica si sigue vivo
+          origLog(chalk.yellow(`⚠️ Detectada otra instancia activa (PID ${oldPid}). Cerrándola para proteger la sesión...`));
+          try { process.kill(oldPid, 'SIGTERM'); } catch {}
+          await new Promise(r => setTimeout(r, 800));
+          try { process.kill(oldPid, 'SIGKILL'); } catch {}
+        } catch {}
+      }
+    }
+    fs.writeFileSync(PID_FILE, String(process.pid), 'utf8');
+  } catch {}
+}
+
+function cleanupPid() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const saved = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+      if (saved === process.pid) fs.unlinkSync(PID_FILE);
+    }
+  } catch {}
+}
+
+process.on('exit', cleanupPid);
+process.on('SIGINT', () => { cleanupPid(); process.exit(0); });
+process.on('SIGTERM', () => { cleanupPid(); process.exit(0); });
+
 function showBanner() {
   console.clear();
   try {
@@ -61,7 +111,7 @@ function showBanner() {
 
   console.log(chalk.gray('  ─────────────────────────────────────────'));
   console.log(chalk.white('  🤖 Bot     : ') + chalk.green(config.botName));
-  console.log(chalk.white('  🛡️ Modo    : ') + chalk.yellow('Anti-Ban + Cola Segura'));
+  console.log(chalk.white('  🛡️ Modo    : ') + chalk.yellow('Anti-Ban + Auto-Reparación + Watchdog'));
   console.log(chalk.white('  ⚙️ Prefijo : ') + chalk.yellow(config.prefix.join(' ')));
   console.log(chalk.gray('  ─────────────────────────────────────────\n'));
 }
@@ -107,6 +157,7 @@ async function askConnectionMethod() {
 
 async function main() {
   ensureDirs();
+  await enforceSingleInstance();
   showBanner();
 
   const { method, phone } = await askConnectionMethod();
@@ -115,11 +166,11 @@ async function main() {
 }
 
 process.on('uncaughtException', err => {
-  console.error(chalk.red('⚠️ Excepción capturada (bot sigue activo):'), err?.message || err);
+  origErr(chalk.red('⚠️ Excepción capturada (bot sigue activo):'), err?.message || err);
 });
 
 process.on('unhandledRejection', err => {
-  console.error(chalk.red('⚠️ Promesa rechazada (bot sigue activo):'), err?.message || err);
+  origErr(chalk.red('⚠️ Promesa rechazada (bot sigue activo):'), err?.message || err);
 });
 
 main();
