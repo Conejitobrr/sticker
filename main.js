@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const pino = require('pino');
 const chalk = require('chalk');
 const qrcode = require('qrcode-terminal');
@@ -16,7 +17,12 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const config = require('./config');
-const { messageHandler, dispatchGroupUpdate } = require('./handler');
+const {
+  messageHandler,
+  dispatchGroupUpdate,
+  setActiveSocket,
+  attachSendLogger
+} = require('./handler');
 
 const BOOT_TIME_SEC = Math.floor(Date.now() / 1000);
 
@@ -51,7 +57,6 @@ function saveMsgToStore(msg) {
   if (messageStore.size > 1500) messageStore.delete(messageStore.keys().next().value);
 }
 
-// 👥 Caché de grupos con deduplicación (evita Timed Out en ráfagas)
 const groupMetaCache = new Map();
 const inFlightGroupMeta = new Map();
 const GROUP_CACHE_TTL = 10 * 60 * 1000;
@@ -79,7 +84,8 @@ function getMsgTimestampSec(msg) {
 
 function enqueueIncoming(sock, msg) {
   const id = msg?.key?.id;
-  if (!id) return;
+  const jid = msg?.key?.remoteJid;
+  if (!id || !jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return;
 
   if (!markProcessed(id)) {
     stats.duplicates++;
@@ -103,7 +109,12 @@ function drainIncomingQueue() {
     activeWorkers++;
     Promise.resolve()
       .then(() => messageHandler(item.sock, item.msg, { stats }))
-      .catch(err => console.log(chalk.red('❌ Error procesando mensaje en cola:'), err?.message || err))
+      .catch(err => {
+        const msgErr = String(err?.message || err);
+        if (!/Connection Closed|Timed Out/i.test(msgErr)) {
+          console.log(chalk.red('❌ Error procesando mensaje en cola:'), msgErr);
+        }
+      })
       .finally(() => {
         stats.processed++;
         activeWorkers--;
@@ -112,7 +123,6 @@ function drainIncomingQueue() {
   }
 }
 
-// 🧹 Limpieza MANUAL solamente (cuando el Owner ejecuta .fixsession). NO borra creds.json.
 function cleanCorruptedSignalSessions() {
   const sessionDir = path.resolve(process.cwd(), config.sessionPath);
   if (!fs.existsSync(sessionDir)) return 0;
@@ -132,13 +142,27 @@ function cleanCorruptedSignalSessions() {
 let currentSock = null;
 let watchdogTimer = null;
 let reconnectTimer = null;
+let stableTimer = null;
 let reconnectAttempts = 0;
 let isReconnecting = false;
+let ackErrorTimes = [];
+
+function isSocketOpen(sock) {
+  if (!sock?.ws) return false;
+  if (typeof sock.ws.isOpen === 'boolean') return sock.ws.isOpen;
+  if (sock.ws.socket && typeof sock.ws.socket.readyState === 'number') return sock.ws.socket.readyState === 1;
+  if (typeof sock.ws.readyState === 'number') return sock.ws.readyState === 1;
+  return true;
+}
 
 function destroySocket(sock) {
   if (watchdogTimer) {
     clearInterval(watchdogTimer);
     watchdogTimer = null;
+  }
+  if (stableTimer) {
+    clearTimeout(stableTimer);
+    stableTimer = null;
   }
   if (!sock) return;
   try { sock.ev.removeAllListeners(); } catch {}
@@ -146,17 +170,51 @@ function destroySocket(sock) {
   try { sock.end?.(); } catch {}
 }
 
+// 🔄 Reinicio limpio del proceso si el stream de Baileys queda atascado en Stream Errored (ack)
+function restartProcessCleanly(reason) {
+  console.log(chalk.bgYellow.black('\n 🔄 AUTO-REINICIO LIMPIO ') + chalk.yellow(` Motivo: ${reason}. Reiniciando proceso en 3s...`));
+  const old = currentSock;
+  currentSock = null;
+  setActiveSocket(null);
+  destroySocket(old);
+
+  setTimeout(() => {
+    const entry = path.join(process.cwd(), 'index.js');
+    const child = spawn(process.execPath, [entry], {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: 'inherit',
+      env: process.env
+    });
+    child.unref();
+    process.exit(0);
+  }, 3000);
+}
+
 function scheduleReconnect(reason = 'desconexión', customDelayMs = null) {
   if (!config.autoReconnect || isReconnecting) return;
+
+  // Detectar bucle de Stream Errored (ack) -> reinicio limpio de Node al 4to fallo en 2 min
+  if (/Stream Errored \(ack\)/i.test(reason)) {
+    const now = Date.now();
+    ackErrorTimes = ackErrorTimes.filter(t => now - t < 2 * 60 * 1000);
+    ackErrorTimes.push(now);
+    if (ackErrorTimes.length >= 4) {
+      isReconnecting = true;
+      return restartProcessCleanly('bucle Stream Errored (ack)');
+    }
+  }
+
   isReconnecting = true;
   reconnectAttempts++;
   stats.reconnects++;
 
   const oldSock = currentSock;
   currentSock = null;
+  setActiveSocket(null);
   destroySocket(oldSock);
 
-  const delay = customDelayMs ?? Math.min(30000, 3000 * Math.pow(1.4, Math.min(reconnectAttempts, 6)));
+  const delay = customDelayMs ?? Math.min(45000, 4000 * Math.pow(1.6, Math.min(reconnectAttempts - 1, 5)));
   console.log(chalk.yellow(`\n⚠️ Reconexión programada (${reason}). Reintentando en ${(delay / 1000).toFixed(1)}s (intento #${reconnectAttempts})...`));
 
   if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -164,15 +222,6 @@ function scheduleReconnect(reason = 'desconexión', customDelayMs = null) {
     isReconnecting = false;
     startBot({ method: 'saved' });
   }, delay);
-}
-
-// 💓 Watchdog corregido para Baileys v6.7.x (usa ws.isOpen y requiere 3 fallos reales)
-function isSocketOpen(sock) {
-  if (!sock?.ws) return false;
-  if (typeof sock.ws.isOpen === 'boolean') return sock.ws.isOpen;
-  if (sock.ws.socket && typeof sock.ws.socket.readyState === 'number') return sock.ws.socket.readyState === 1;
-  if (typeof sock.ws.readyState === 'number') return sock.ws.readyState === 1;
-  return true;
 }
 
 function startWatchdog(sock) {
@@ -189,27 +238,31 @@ function startWatchdog(sock) {
       missedPings++;
       if (missedPings >= 2) {
         console.log(chalk.red('\n🔌 [WATCHDOG] WebSocket cerrado. Reconectando...'));
-        scheduleReconnect('socket cerrado', 3000);
+        scheduleReconnect('socket cerrado', 3500);
       }
       return;
     }
 
-    try {
-      await Promise.race([
-        sock.query({
-          tag: 'iq',
-          attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' },
-          content: [{ tag: 'ping', attrs: {} }]
-        }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('PING_TIMEOUT')), 20000))
-      ]);
+    // Evita promesas rechazadas sin capturar si el ping vence tarde
+    const pingPromise = sock.query({
+      tag: 'iq',
+      attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' },
+      content: [{ tag: 'ping', attrs: {} }]
+    }).then(() => true).catch(() => false);
+
+    const ok = await Promise.race([
+      pingPromise,
+      new Promise(res => setTimeout(() => res(false), 18000))
+    ]);
+
+    if (ok) {
       missedPings = 0;
-    } catch {
+    } else {
       missedPings++;
       console.log(chalk.yellow(`⚠️ [WATCHDOG] Latido sin respuesta (${missedPings}/3)...`));
       if (missedPings >= 3) {
-        console.log(chalk.red('\n💀 [WATCHDOG] Conexión congelada confirmada. Reiniciando socket...'));
-        scheduleReconnect('conexión congelada', 3000);
+        console.log(chalk.red('\n💀 [WATCHDOG] Conexión congelada tras reposo. Reiniciando socket...'));
+        scheduleReconnect('conexión congelada', 3500);
       }
     }
   }, 90000);
@@ -217,6 +270,7 @@ function startWatchdog(sock) {
 
 async function startBot({ method = 'saved', phone = null } = {}) {
   if (currentSock) {
+    setActiveSocket(null);
     destroySocket(currentSock);
     currentSock = null;
   }
@@ -244,35 +298,33 @@ async function startBot({ method = 'saved', phone = null } = {}) {
     browser: Browsers.macOS('Safari'),
     markOnlineOnConnect: false,
     syncFullHistory: false,
-    fireInitQueries: false,
+    fireInitQueries: true,              // Evita desincronización de acks al conectar
     generateHighQualityLinkPreview: false,
     defaultQueryTimeoutMs: 45000,
     keepAliveIntervalMs: 25000,
     connectTimeoutMs: 45000,
-    retryRequestDelayMs: 500,
+    retryRequestDelayMs: 600,
     msgRetryCounterCache,
-    shouldIgnoreJid: jid => !jid || jid === 'status@broadcast' || jid.endsWith('@newsletter'),
     getMessage: async (key) => messageStore.get(key?.id) || { conversation: '' }
   });
 
   currentSock = sock;
+  attachSendLogger(sock);
 
-  // Caché segura con timeout de 6s y fallback para nunca bloquear la cola
   sock.getCachedGroupMetadata = async (jid, force = false) => {
     const cached = groupMetaCache.get(jid);
     if (!force && cached && Date.now() < cached.exp) return cached.data;
-
     if (inFlightGroupMeta.has(jid)) return inFlightGroupMeta.get(jid);
 
+    const rawFetch = sock.groupMetadata(jid).catch(() => null);
     const fetchPromise = Promise.race([
-      sock.groupMetadata(jid),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('META_TIMEOUT')), 6000))
+      rawFetch,
+      new Promise(res => setTimeout(() => res(null), 6000))
     ])
       .then(data => {
-        groupMetaCache.set(jid, { data, exp: Date.now() + GROUP_CACHE_TTL });
-        return data;
+        if (data) groupMetaCache.set(jid, { data, exp: Date.now() + GROUP_CACHE_TTL });
+        return data || cached?.data || null;
       })
-      .catch(() => cached?.data || null)
       .finally(() => inFlightGroupMeta.delete(jid));
 
     inFlightGroupMeta.set(jid, fetchPromise);
@@ -312,15 +364,26 @@ async function startBot({ method = 'saved', phone = null } = {}) {
     }
 
     if (connection === 'open') {
-      reconnectAttempts = 0;
       isReconnecting = false;
+      setActiveSocket(sock);
       startWatchdog(sock);
+
+      // Solo reinicia el backoff si dura 45s estable sin volver a caerse
+      if (stableTimer) clearTimeout(stableTimer);
+      stableTimer = setTimeout(() => {
+        if (sock === currentSock) {
+          reconnectAttempts = 0;
+          ackErrorTimes = [];
+        }
+      }, 45000);
+
       const myId = (sock.user?.id || '').split(':')[0];
       console.log(chalk.bgGreen.black('\n ✅ CONECTADO ') + chalk.green.bold(` ${config.botName} activo como +${myId}`));
-      console.log(chalk.gray(' 🛡️ Anti-Ban + Watchdog Estable activos\n'));
+      console.log(chalk.gray(' 🛡️ Anti-Ban + Watchdog Estable + Proxy Vivo activos\n'));
     }
 
     if (connection === 'close') {
+      setActiveSocket(null);
       const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const reasonText = lastDisconnect?.error?.message || `código ${statusCode}`;
 
@@ -331,7 +394,7 @@ async function startBot({ method = 'saved', phone = null } = {}) {
         return;
       }
 
-      const customDelay = statusCode === DisconnectReason.connectionReplaced ? 8000 : null;
+      const customDelay = statusCode === DisconnectReason.connectionReplaced ? 10000 : null;
       scheduleReconnect(reasonText, customDelay);
     }
   });
