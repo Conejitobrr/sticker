@@ -214,9 +214,12 @@ function attachSendLogger(sock) {
             if (preview) console.log(chalk.gray(`│ 💬  Msg     : `) + chalk.green(String(preview).slice(0, 70).replace(/\n/g, ' ')));
             console.log(chalk.gray(`╰──────────────────────────────────────────\n`));
           }
-
-          const result = await originalSend(jid, content, options);
-
+          
+          const result = await Promise.race([
+            originalSend(jid, content, options),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('SEND_TIMEOUT')), 25000))
+          ]);
+          
           if (config.antiBan?.simulateTyping && !content.react && !content.delete) {
             try { await sock.sendPresenceUpdate('paused', jid); } catch {}
           }
